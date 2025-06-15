@@ -14,15 +14,13 @@ client = WebClient(token=slack_token)
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    data = request.form
+    data = request.get_json()
+    print("==== Slack Command Received ====")
+    print(data)
+
     text = data.get("text")
     channel = data.get("channel_id")
     user_id = data.get("user_id")
-
-    print("==== Slack Command Received ====")
-    print(f"User: {user_id}")
-    print(f"Channel: {channel}")
-    print(f"Text: {text}")
 
     def handle_gpt():
         try:
