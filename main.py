@@ -1,16 +1,3 @@
-# main.py
-# ────────────────────────────────────────────────────────────────────────────
-"""
-JENCO GPT Slack-Bot
-──────────────────
-Минимальное Flask-приложение, которое:
-  • проверяет /health (GET /) — важен для Render/K8s-проб;
-  • обрабатывает входящие события Slack (POST /slack/events);
-  • пересылает текстовые сообщения в OpenAI (gpt-4o, gpt-4o-mini и т.д.);
-  • отправляет ответ обратно в канал.
-Лёгкая запись логов + опциональная верификация подписи Slack.
-"""
-
 from __future__ import annotations
 
 import json
@@ -20,7 +7,7 @@ import threading
 from typing import Any
 
 import openai
-from flask import Flask, abort, request
+from flask import Flask, abort, request, jsonify
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.signature import SignatureVerifier
@@ -78,7 +65,12 @@ def slack_events() -> tuple[str, int]:
 
     # Команда /slash → challenge / event callback (url_verification)
     if form.get("type") == "url_verification":
-        return form.get("challenge", ""), 200
+        challenge = form.get("challenge")
+        if challenge:
+            return jsonify({"challenge": challenge}), 200
+        else:
+            logging.warning("⚠️  Missing challenge in url_verification payload")
+            return "Invalid url_verification", 400
 
     # Текст и метаданные
     text: str | None     = form.get("text")
