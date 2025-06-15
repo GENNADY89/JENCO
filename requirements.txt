@@ -1,4 +1,5 @@
-flask
-openai>=1.0.0
+slack_bolt
 slack_sdk
+openai
 python-dotenv
+requests
