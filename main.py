@@ -1,138 +1,110 @@
 from __future__ import annotations
-
-import json
-import logging
-import os
-import threading
-from typing import Any
+import os, logging, threading
+from typing import Any, List
 
 import openai
-from flask import Flask, abort, request, jsonify
+from flask import Flask, request, jsonify, abort
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 from slack_sdk.signature import SignatureVerifier
+from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
 
-# ─── Загружаем .env (локально) ───────────────────────────────────────────────
-load_dotenv(override=False)
+# ─── env ────────────────────────────────────────────────────────────────────
+load_dotenv()
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
+SLACK_BOT_TOKEN      = os.getenv("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")           # optional
 
-# ─── Обязательные переменные окружения ───────────────────────────────────────
-OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY")
-SLACK_BOT_TOKEN       = os.getenv("SLACK_BOT_TOKEN")
-SLACK_SIGNING_SECRET  = os.getenv("SLACK_SIGNING_SECRET")  # можно None
+for k, v in {"OPENAI_API_KEY":OPENAI_API_KEY,
+             "SLACK_BOT_TOKEN":SLACK_BOT_TOKEN}.items():
+    if not v: raise RuntimeError(f"Missing {k}")
 
-REQUIRED_ENV_VARS = {
-    "OPENAI_API_KEY": OPENAI_API_KEY,
-    "SLACK_BOT_TOKEN": SLACK_BOT_TOKEN,
-}
-missing = [k for k, v in REQUIRED_ENV_VARS.items() if not v]
-if missing:
-    raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
-
-# ─── Инициализация внешних SDK ───────────────────────────────────────────────
 openai.api_key = OPENAI_API_KEY
 slack_client   = WebClient(token=SLACK_BOT_TOKEN)
-sign_verifier  = SignatureVerifier(SLACK_SIGNING_SECRET) if SLACK_SIGNING_SECRET else None
+sign_verifier  = (SignatureVerifier(SLACK_SIGNING_SECRET)
+                  if SLACK_SIGNING_SECRET else None)
 
-# ─── Flask-приложение ────────────────────────────────────────────────────────
+# ─── flask ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Health-check (Render / Kubernetes etc.)
 @app.get("/")
-def health() -> tuple[dict[str, str], int]:
-    return {"status": "ok", "service": "JENCO GPT Slack Bot"}, 200
+def health():                                              # Render / k8s probe
+    return {"status":"ok","service":"JENCO GPT Slack Bot"}, 200
 
-MAX_MESSAGE_LENGTH = 4000
+# ─── utils ──────────────────────────────────────────────────────────────────
+MAX_MSG = 4000
 
-def split_message(message: str) -> list[str]:
-    """Функция для разбиения длинных сообщений на несколько частей"""
-    messages = []
-    while len(message) > MAX_MESSAGE_LENGTH:
-        part = message[:MAX_MESSAGE_LENGTH]
-        message = message[MAX_MESSAGE_LENGTH:]
-        messages.append(part)
-    if message:
-        messages.append(message)
-    return messages
+def split_msg(text: str) -> List[str]:
+    return [text[i:i+MAX_MSG] for i in range(0, len(text), MAX_MSG)]
 
-def send_message_in_parts(channel: str, user: str, message: str):
-    """Отправка сообщения по частям, если оно слишком длинное"""
-    parts = split_message(message)
-    for part in parts:
+def send_in_parts(channel: str, user: str, text: str) -> None:
+    for chunk in split_msg(text):
         try:
-            slack_client.chat_postMessage(channel=channel, text=f"<@{user}> {part}")
+            slack_client.chat_postMessage(channel=channel,
+                                          text=f"<@{user}> {chunk}")
         except SlackApiError as e:
-            logging.error(f"Error sending message: {e.response['error']}")
+            logging.error("Slack post error: %s", e.response["error"])
 
+# ─── main handler ───────────────────────────────────────────────────────────
 @app.post("/slack/events")
-def slack_events() -> tuple[str, int]:
-    """
-    Базовый обработчик slash-команд и сообщений (event_subscriptions → 'messages').
-    Slack шлёт форму application/x-www-form-urlencoded.
-    """
-    # Защита от бесконечных ретраев Slack (Retry-Num header)
+def slack_events():                                         # one endpoint for
+    # 1) Slack Retry-Num (дубли) ------------------------------------------------
     if request.headers.get("X-Slack-Retry-Num"):
         return "retry_ack", 200
 
-    # Валидация подписи Slack (если задан секрет)
+    # 2) signature --------------------------------------------------------------
     if sign_verifier and not sign_verifier.is_valid_request(
-        request.get_data(), request.headers
-    ):
-        logging.warning("⚠️  Invalid Slack signature")
-        abort(400, description="Invalid signature")
+            request.get_data(), request.headers):
+        abort(400, "Invalid signature")
 
     form = request.form
 
-    # Команда /slash → challenge / event callback (url_verification)
+    # 3) url_verification (challenge) -------------------------------------------
     if form.get("type") == "url_verification":
-        challenge = form.get("challenge")
-        if challenge:
-            return jsonify({"challenge": challenge}), 200
-        else:
-            logging.warning("⚠️  Missing challenge in url_verification payload")
-            return "Invalid url_verification", 400
+        return jsonify({"challenge": form.get("challenge")}), 200
 
-    # Текст и метаданные
-    text: str | None     = form.get("text")
-    channel_id: str | None = form.get("channel_id")
-    user_id: str | None    = form.get("user_id")
+    # 4) slash command payload --------------------------------------------------
+    text      = form.get("text")
+    channel   = form.get("channel_id")
+    user      = form.get("user_id")
+    resp_url  = form.get("response_url")          # на случай if needed
 
-    if not (text and channel_id and user_id):
-        logging.warning("⚠️  Ignored empty payload")
+    if not all([text, channel, user]):
+        logging.warning("empty payload")
         return "ignored", 200
 
-    def ask_gpt(message: str, channel: str, user: str) -> None:
-        """Запуск в отдельном потоке, чтобы не блокировать Slack."""
-        try:
-            response: dict[str, Any] = openai.chat.completions.create(
-                model="gpt-4o-mini",  # можно заменить на gpt-4o
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Ты корпоративный ассистент компании BEM/JENCO.",
-                    },
-                    {"role": "user", "content": message},
-                ],
-                max_tokens=500,
-                temperature=0.4,
-            )
-            answer: str = response.choices[0].message.content.strip()
-            send_message_in_parts(channel, user, answer)
-        except SlackApiError as e:
-            logging.error("Slack API error: %s", e)
-        except Exception as e:
-            logging.exception("GPT error: %s", e)
-            slack_client.chat_postMessage(
-                channel=channel, text=f"<@{user}> GPT Error: {e}"
-            )
-
-    threading.Thread(target=ask_gpt, args=(text, channel_id, user_id), daemon=True).start()
-    return "OK", 200
+    # 4.1 мгновенный ответ Slack-у (<3 с)
+    #     • "ephemeral" — видно только автору
+    #     • "in_channel" — видят все + Slack публикует сам текст команды
+    first_reply = {
+        "response_type": "ephemeral",
+        "text":        "⏳ GPT думает… (обычно 3-8 с)",
+    }
+    threading.Thread(target=process_gpt,
+                     args=(text, channel, user),
+                     daemon=True).start()
+    return jsonify(first_reply), 200
 
 
-# ─── Запуск локально / gunicorn ──────────────────────────────────────────────
+def process_gpt(prompt: str, channel: str, user: str) -> None:
+    """Runs in background thread: asks GPT & posts answer."""
+    try:
+        resp: dict[str, Any] = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role":"system",
+                 "content":"Ты корпоративный ассистент компании BEM/JENCO."},
+                {"role":"user","content":prompt},
+            ],
+            max_tokens=800, temperature=0.4)
+        answer = resp.choices[0].message.content.strip()
+        send_in_parts(channel, user, answer)      # текст >4 000? → разобьём
+    except Exception as e:
+        logging.exception("GPT error")
+        slack_client.chat_postMessage(
+            channel=channel, text=f"<@{user}> ⚠️ GPT error: {e}")
+
+# ─── local run ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # PORT приходит от Render, Railway, Heroku и др.
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
