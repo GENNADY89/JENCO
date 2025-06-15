@@ -1,121 +1,130 @@
 import os
-import time
-import logging
-from collections import deque
+import threading
+from flask import Flask, request, jsonify, abort
 
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-from openai import OpenAI
+from slack_sdk.signature import SignatureVerifier
+import openai
 
-# ────── Настройка ──────────────────────────────────────────────────────────────
-load_dotenv()
+# ─── Конфигурация ──────────────────────────────────────────────────────────────
+openai.api_key = os.environ["OPENAI_API_KEY"]                   # обязательно
+SLACK_BOT_TOKEN      = os.environ["SLACK_BOT_TOKEN"]            # Bot-User-OAuth
+SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")   # Signing Secret
 
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-
-openai_client  = OpenAI(api_key=OPENAI_API_KEY)
+app            = Flask(__name__)
 slack_client   = WebClient(token=SLACK_BOT_TOKEN)
+sign_verifier  = SignatureVerifier(signing_secret=SLACK_SIGNING_SECRET)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s ▶ %(levelname)s ▶ %(message)s")
+# узнаём ID нашего бота, чтобы позже игнорировать свои же сообщения
+BOT_ID = slack_client.auth_test()["user_id"]
 
-# Запоминаем последние 100 ID событий, чтобы не обрабатывать дубликаты
-recent_event_ids: deque[str] = deque(maxlen=100)
 
-app = Flask(__name__)
+# ─── Вспомогательная функция общения с OpenAI ──────────────────────────────────
+def ask_gpt(user_text: str) -> str:
+    """Обращается к GPT-4o и возвращает ответ."""
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ты корпоративный ассистент компании BEM/JENCO. "
+                    "Отвечай дружелюбно, кратко и по делу."
+                ),
+            },
+            {"role": "user", "content": user_text},
+        ],
+        max_tokens=500,
+        temperature=0.5,
+    )
+    return response.choices[0].message.content.strip()
 
-# ────── Health-check ──────────────────────────────────────────────────────────
-@app.get("/")
-def health():
-    return "JENCO-GPT bot is running", 200
 
-# ────── Главный эндпоинт Slack ────────────────────────────────────────────────
-@app.post("/slack/events")
+# ─── Маршруты ──────────────────────────────────────────────────────────────────
+@app.route("/", methods=["GET", "HEAD"])
+def root():
+    """Health-check для Render (возвращает 200)."""
+    return "OK", 200
+
+
+@app.route("/slack/commands", methods=["POST"])
+def slash_commands():
+    """Обрабатывает slash-команду  /gpt  (или любую другую, которую вы настроили)."""
+    # Slack шлёт application/x-www-form-urlencoded → request.form
+    if not sign_verifier.is_valid_request(request.get_data(), request.headers):
+        abort(403)
+
+    text       = request.form.get("text", "").strip() or "Пустой запрос."
+    channel_id = request.form["channel_id"]
+    user_id    = request.form["user_id"]
+
+    # Быстрый ответ Slack'у, чтобы не истекал таймаут
+    # (Slack требует ответить <3 сек.)
+    def _async_work():
+        answer = ask_gpt(text)
+        try:
+            slack_client.chat_postMessage(
+                channel=channel_id,
+                text=f"<@{user_id}> {answer}",
+            )
+        except SlackApiError as e:
+            slack_client.chat_postMessage(
+                channel=channel_id,
+                text=f"Ошибка GPT: {e.response['error']}",
+            )
+
+    threading.Thread(target=_async_work, daemon=True).start()
+    return jsonify(response_type="ephemeral", text="💬 Ответ отправлен в канал."), 200
+
+
+@app.route("/slack/events", methods=["POST"])
 def slack_events():
-    # Slack slash-command присылает form-urlencoded, а Events API — JSON
-    if request.content_type == "application/x-www-form-urlencoded":
-        return handle_slash_command(request.form)
+    """Endpoint для Events API."""
+    # Slack шлёт JSON → request.get_json()
+    if not sign_verifier.is_valid_request(request.get_data(), request.headers):
+        abort(403)
 
-    data = request.get_json(silent=True) or {}
-    logging.debug(f"Incoming JSON: {data}")
+    data = request.get_json()
 
-    # 1. Проверка URL (challenge)
+    # Шаг 1 — Challenge verification при включении Events API
     if data.get("type") == "url_verification":
-        return jsonify({"challenge": data.get("challenge")})
+        return jsonify({"challenge": data["challenge"]})
 
-    # 2. Сами события
+    # Шаг 2 — Обработка событий
     if data.get("type") == "event_callback":
-        event_id = data.get("event_id")
-        if event_id in recent_event_ids:
-            return "", 200  # уже обработали
-        recent_event_ids.append(event_id)
+        event = data["event"]
 
-        event = data.get("event", {})
+        # Игнорируем все сообщения от ботов (в том числе от себя)
+        if event.get("subtype") == "bot_message" or event.get("user") == BOT_ID:
+            return "OK", 200
 
-        # Интересуют только упоминания бота пользователем
-        if event.get("type") == "app_mention" and not event.get("bot_id"):
-            handle_app_mention(event)
+        # Будем отвечать только на @упоминания, чтобы не захлестнуть канал
+        if event.get("type") == "app_mention":
+            user_id    = event["user"]
+            channel_id = event["channel"]
+            text       = event.get("text", "")
 
-    return "", 200
+            def _async_mention():
+                answer = ask_gpt(text)
+                try:
+                    slack_client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"<@{user_id}> {answer}",
+                    )
+                except SlackApiError as e:
+                    slack_client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"Ошибка GPT: {e.response['error']}",
+                    )
 
-# ────── Обработка /gpt … ──────────────────────────────────────────────────────
-def handle_slash_command(form):
-    user_id   = form.get("user_id")
-    channel   = form.get("channel_id")
-    text      = form.get("text", "").strip()
+            threading.Thread(target=_async_mention, daemon=True).start()
 
-    if not text:
-        return jsonify(
-            response_type="ephemeral",
-            text="⚠️ Нужно написать вопрос после `/gpt`."
-        )
+    # Всегда отвечаем 200 OK, чтобы Slack не повторял событие
+    return "OK", 200
 
-    answer = ask_openai(text)
 
-    try:
-        slack_client.chat_postMessage(channel=channel, text=answer)
-    except SlackApiError as e:
-        logging.error(f"Slack error on slash command: {e.response['error']}")
-
-    # Мгновенный response Slack’у, чтобы не ждать 3 сек
-    return jsonify(response_type="in_channel", text="💬 Ответ отправлен в канал.")
-
-# ────── Обработка @bot … ──────────────────────────────────────────────────────
-def handle_app_mention(event: dict):
-    channel = event.get("channel")
-    user_id = event.get("user")
-    raw    = event.get("text", "")
-    # Убираем упоминание <@BOTID>
-    prompt = raw.split(">", 1)[-1].strip()
-
-    answer = ask_openai(prompt)
-
-    message = f"<@{user_id}> {answer}"
-    try:
-        slack_client.chat_postMessage(channel=channel, text=message)
-    except SlackApiError as e:
-        logging.error(f"Slack error on mention: {e.response['error']}")
-
-# ────── Вызов OpenAI ──────────────────────────────────────────────────────────
-def ask_openai(prompt: str) -> str:
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",          # можно заменить на gpt-4 или gpt-3.5
-            messages=[
-                {"role": "system", "content": "Ты корпоративный ассистент компании BEM/JENCO."},
-                {"role": "user",    "content": prompt}
-            ],
-            max_tokens=500,
-            temperature=0.5,
-            timeout=30    # секунд
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"OpenAI error: {e}")
-        return "⚠️ Произошла ошибка при обращении к GPT."
-
-# ────── Запуск (нужно для Render) ─────────────────────────────────────────────
+# ─── Запуск приложения (важно для Render) ──────────────────────────────────────
 if __name__ == "__main__":
-    # Render сам назначит переменную PORT, но мы фиксируем 10000, чтобы логи совпадали
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
