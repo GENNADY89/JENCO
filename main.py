@@ -43,6 +43,27 @@ logging.basicConfig(level=logging.INFO)
 def health() -> tuple[dict[str, str], int]:
     return {"status": "ok", "service": "JENCO GPT Slack Bot"}, 200
 
+MAX_MESSAGE_LENGTH = 4000
+
+def split_message(message: str) -> list[str]:
+    """Функция для разбиения длинных сообщений на несколько частей"""
+    messages = []
+    while len(message) > MAX_MESSAGE_LENGTH:
+        part = message[:MAX_MESSAGE_LENGTH]
+        message = message[MAX_MESSAGE_LENGTH:]
+        messages.append(part)
+    if message:
+        messages.append(message)
+    return messages
+
+def send_message_in_parts(channel: str, user: str, message: str):
+    """Отправка сообщения по частям, если оно слишком длинное"""
+    parts = split_message(message)
+    for part in parts:
+        try:
+            slack_client.chat_postMessage(channel=channel, text=f"<@{user}> {part}")
+        except SlackApiError as e:
+            logging.error(f"Error sending message: {e.response['error']}")
 
 @app.post("/slack/events")
 def slack_events() -> tuple[str, int]:
@@ -97,7 +118,7 @@ def slack_events() -> tuple[str, int]:
                 temperature=0.4,
             )
             answer: str = response.choices[0].message.content.strip()
-            slack_client.chat_postMessage(channel=channel, text=f"<@{user}> {answer}")
+            send_message_in_parts(channel, user, answer)
         except SlackApiError as e:
             logging.error("Slack API error: %s", e)
         except Exception as e:
