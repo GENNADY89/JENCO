@@ -1,163 +1,125 @@
-#!/usr/bin/env python3
-"""JENCO‑GPT‑BOT main entry‑point.
-
-• Слушает события Slack (`/slack/events`)  
-• Обрабатывает slash‑команду `/gpt`  
-• Делает запрос к OpenAI и отправляет ответ в тот же канал / тред.
-
-Перед запуском ОБЯЗАТЕЛЬНЫ переменные окружения:
-    SLACK_SIGNING_SECRET – из Your App → Basic Information → Signing Secret
-    SLACK_BOT_TOKEN      – Bot OAuth Token (xoxb‑…)
-    OPENAI_API_KEY       – ключ OpenAI
-
-Render автоматически задаёт PORT, поэтому app.run() берёт его из env.
+# main.py
+# ────────────────────────────────────────────────────────────────────────────
 """
+JENCO GPT Slack-Bot
+──────────────────
+Минимальное Flask-приложение, которое:
+  • проверяет /health (GET /) — важен для Render/K8s-проб;
+  • обрабатывает входящие события Slack (POST /slack/events);
+  • пересылает текстовые сообщения в OpenAI (gpt-4o, gpt-4o-mini и т.д.);
+  • отправляет ответ обратно в канал.
+Лёгкая запись логов + опциональная верификация подписи Slack.
+"""
+
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Any, Dict
+import threading
+from typing import Any
 
-from flask import Flask, jsonify, make_response, request
+import openai
+from flask import Flask, abort, request
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.signature import SignatureVerifier
+from dotenv import load_dotenv
 
-# ---------------------------------------------------------------------------
-#  Конфигурация и проверки окружения
-# ---------------------------------------------------------------------------
-REQUIRED_VARS = ("SLACK_SIGNING_SECRET", "SLACK_BOT_TOKEN", "OPENAI_API_KEY")
-missing = [name for name in REQUIRED_VARS if not os.getenv(name)]
+# ─── Загружаем .env (локально) ───────────────────────────────────────────────
+load_dotenv(override=False)
+
+# ─── Обязательные переменные окружения ───────────────────────────────────────
+OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY")
+SLACK_BOT_TOKEN       = os.getenv("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET  = os.getenv("SLACK_SIGNING_SECRET")  # можно None
+
+REQUIRED_ENV_VARS = {
+    "OPENAI_API_KEY": OPENAI_API_KEY,
+    "SLACK_BOT_TOKEN": SLACK_BOT_TOKEN,
+}
+missing = [k for k, v in REQUIRED_ENV_VARS.items() if not v]
 if missing:
     raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
-SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+# ─── Инициализация внешних SDK ───────────────────────────────────────────────
+openai.api_key = OPENAI_API_KEY
+slack_client   = WebClient(token=SLACK_BOT_TOKEN)
+sign_verifier  = SignatureVerifier(SLACK_SIGNING_SECRET) if SLACK_SIGNING_SECRET else None
 
-# ---------------------------------------------------------------------------
-#  Логирование
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-#  Инициализация библиотек
-# ---------------------------------------------------------------------------
+# ─── Flask-приложение ────────────────────────────────────────────────────────
 app = Flask(__name__)
-client = WebClient(token=SLACK_BOT_TOKEN)
-sign_verifier = SignatureVerifier(SLACK_SIGNING_SECRET)
+logging.basicConfig(level=logging.INFO)
 
-# ---------------------------------------------------------------------------
-#  Вспомогательные функции
-# ---------------------------------------------------------------------------
-
-def chatgpt(prompt: str) -> str:
-    """Отправляем запрос в OpenAI и возвращаем ответ."""
-    import openai  # импортируем внутри функции, чтобы не тянуть при unit‑тестах
-
-    openai.api_key = OPENAI_API_KEY
-    try:
-        resp = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.8,
-            max_tokens=512,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as exc:  # pylint: disable=broad-except
-        log.exception("OpenAI API error: %s", exc)
-        return "⚠️ Sorry, I couldn't get a response from OpenAI."
+# Health-check (Render / Kubernetes etc.)
+@app.get("/")
+def health() -> tuple[dict[str, str], int]:
+    return {"status": "ok", "service": "JENCO GPT Slack Bot"}, 200
 
 
-def _post_message(channel: str, text: str, thread_ts: str | None = None) -> None:
-    """Отправляем сообщение в Slack с базовой обработкой ошибок."""
-    try:
-        client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
-    except SlackApiError as err:
-        log.error("Slack API error: %s", err.response["error"])
-
-
-# ---------------------------------------------------------------------------
-#  HTTP‑маршруты
-# ---------------------------------------------------------------------------
-@app.route("/", methods=["GET"])  # health‑check
-def index():  # noqa: D401  (простая функция‑хэндлер)
-    return "JENCO‑GPT‑BOT is alive ✔", 200
-
-
-@app.route("/slack/events", methods=["POST"])
-def slack_events():
-    """Главный приёмник событий Slack Events API."""
-    # 1) обработка повторных доставок от Slack
+@app.post("/slack/events")
+def slack_events() -> tuple[str, int]:
+    """
+    Базовый обработчик slash-команд и сообщений (event_subscriptions → 'messages').
+    Slack шлёт форму application/x-www-form-urlencoded.
+    """
+    # Защита от бесконечных ретраев Slack (Retry-Num header)
     if request.headers.get("X-Slack-Retry-Num"):
-        return make_response("No need to retry", 200)
+        return "retry_ack", 200
 
-    # 2) проверка подписи
-    if not sign_verifier.is_valid_request(request.get_data(), request.headers):
-        log.warning("Invalid Slack signature → 403")
-        return make_response("Invalid request", 403)
-
-    payload: Dict[str, Any] = request.get_json(force=True, silent=True) or {}
-
-    # 3) URL‑verification (первичная валидация эндпоинта)
-    if payload.get("type") == "url_verification":
-        return jsonify({"challenge": payload.get("challenge")})
-
-    # 4) event_callback
-    if payload.get("type") == "event_callback":
-        handle_event(payload.get("event", {}))
-
-    return "", 200
-
-
-def handle_event(event: Dict[str, Any]):
-    """Обработка отдельных ивентов."""
-    etype = event.get("type")
-    if etype == "app_mention":
-        _on_app_mention(event)
-    # Можно добавить другие события при необходимости (message.channels и т.д.)
-
-
-def _on_app_mention(event: Dict[str, Any]):
-    """Ответ на упоминание бота @JENCO‑GPT‑ASSISTANT …"""
-    channel = event.get("channel")
-    thread_ts = event.get("ts")
-
-    raw_text: str = event.get("text", "")
-    prompt = raw_text.split("<@", 1)[-1].split(">", 1)[-1].strip() or "Привет! Чем могу помочь?"
-
-    answer = chatgpt(prompt)
-    _post_message(channel, answer, thread_ts=thread_ts)
-
-
-@app.route("/gpt", methods=["POST"])  # Slash‑command endpoint
-def slash_gpt():  # noqa: D401
-    # Проверяем подпись
-    if not sign_verifier.is_valid_request(request.get_data(), request.headers):
-        return make_response("Invalid request", 403)
+    # Валидация подписи Slack (если задан секрет)
+    if sign_verifier and not sign_verifier.is_valid_request(
+        request.get_data(), request.headers
+    ):
+        logging.warning("⚠️  Invalid Slack signature")
+        abort(400, description="Invalid signature")
 
     form = request.form
-    channel_id = form.get("channel_id")
-    prompt = form.get("text", "").strip() or "Привет! Чем могу помочь?"
 
-    # Отвечаем сразу Slack'у ack, чтобы не словить timeout (3 сек)
-    ack_body = {
-        "response_type": "ephemeral",
-        "text": "💭 Ответ отправляется в канал…"
-    }
+    # Команда /slash → challenge / event callback (url_verification)
+    if form.get("type") == "url_verification":
+        return form.get("challenge", ""), 200
 
-    # Async‑обработка (без Celery, просто fire‑and‑forget)
-    from threading import Thread
+    # Текст и метаданные
+    text: str | None     = form.get("text")
+    channel_id: str | None = form.get("channel_id")
+    user_id: str | None    = form.get("user_id")
 
-    Thread(target=lambda: _post_message(channel_id, chatgpt(prompt))).start()
+    if not (text and channel_id and user_id):
+        logging.warning("⚠️  Ignored empty payload")
+        return "ignored", 200
 
-    return jsonify(ack_body)
+    def ask_gpt(message: str, channel: str, user: str) -> None:
+        """Запуск в отдельном потоке, чтобы не блокировать Slack."""
+        try:
+            response: dict[str, Any] = openai.chat.completions.create(
+                model="gpt-4o-mini",  # можно заменить на gpt-4o
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Ты корпоративный ассистент компании BEM/JENCO.",
+                    },
+                    {"role": "user", "content": message},
+                ],
+                max_tokens=500,
+                temperature=0.4,
+            )
+            answer: str = response.choices[0].message.content.strip()
+            slack_client.chat_postMessage(channel=channel, text=f"<@{user}> {answer}")
+        except SlackApiError as e:
+            logging.error("Slack API error: %s", e)
+        except Exception as e:
+            logging.exception("GPT error: %s", e)
+            slack_client.chat_postMessage(
+                channel=channel, text=f"<@{user}> GPT Error: {e}"
+            )
+
+    threading.Thread(target=ask_gpt, args=(text, channel_id, user_id), daemon=True).start()
+    return "OK", 200
 
 
-# ---------------------------------------------------------------------------
-#  Запуск локального сервера
-# ---------------------------------------------------------------------------
+# ─── Запуск локально / gunicorn ──────────────────────────────────────────────
 if __name__ == "__main__":
+    # PORT приходит от Render, Railway, Heroku и др.
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
