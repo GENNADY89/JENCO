@@ -1,53 +1,70 @@
-from flask import Flask, request, jsonify
 import os
-import openai
+from flask import Flask, request, jsonify
 from slack_sdk import WebClient
-from threading import Thread
+from slack_sdk.errors import SlackApiError
+from dotenv import load_dotenv
+from openai import OpenAI
+import logging
 
-# Инициализация Flask-приложения
+# Load environment variables
+load_dotenv()
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+# Initialize clients
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
 app = Flask(__name__)
 
-# Загрузка переменных окружения
-openai.api_key = os.environ.get("OPENAI_API_KEY")
-slack_token = os.environ.get("SLACK_BOT_TOKEN")
-client = WebClient(token=slack_token)
+@app.route("/", methods=["GET"])
+def index():
+    return "Slack GPT bot is running."
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     data = request.get_json()
 
-    # Обработка подтверждения URL от Slack
+    # Handle Slack URL verification
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data.get("challenge")})
 
-    event = data.get("event", {})
-    user_id = event.get("user")
-    channel = event.get("channel")
-    text = event.get("text", "")
+    # Handle Slack event callbacks
+    if data.get("type") == "event_callback":
+        event = data.get("event", {})
+        if event.get("type") == "app_mention" and "bot_id" not in event:
+            user = event.get("user")
+            text = event.get("text")
+            channel = event.get("channel")
 
-    # Игнорируем события от ботов (включая самого себя)
-    if "bot_id" in event or user_id is None:
-        return "Ignored bot message", 200
+            logging.info(f"Message from {user}: {text}")
 
-    def handle_gpt():
-        try:
-            response = openai.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "Ты корпоративный ассистент компании BEM/JENCO."},
-                    {"role": "user", "content": text}
-                ],
-                max_tokens=500,
-                temperature=0.5
-            )
-            answer = response.choices[0].message.content
-            client.chat_postMessage(channel=channel, text=f"<@{user_id}> {answer}")
-        except Exception as e:
-            client.chat_postMessage(channel=channel, text=f"Ошибка GPT: {str(e)}")
+            # Remove bot mention from text
+            prompt = text.split(">", 1)[-1].strip()
 
-    Thread(target=handle_gpt).start()
-    return "OK", 200
+            # Get completion from OpenAI
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=500
+                )
+                reply = response.choices[0].message.content.strip()
 
-# Запуск Flask-сервера на внешнем порту (обязательно для Render)
+                # Send reply back to Slack
+                slack_client.chat_postMessage(channel=channel, text=reply)
+            except SlackApiError as e:
+                logging.error(f"Slack API error: {e.response['error']}")
+            except Exception as e:
+                logging.error(f"OpenAI error: {e}")
+
+    return "", 200
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=10000)
