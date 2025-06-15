@@ -1,104 +1,71 @@
-import os, json, logging
-from flask import Flask, request, make_response, jsonify
-from slack_sdk import WebClient
+import os
+from flask import Flask, request, make_response
 from slack_sdk.signature import SignatureVerifier
-from openai import OpenAI
+from slack_sdk.web import WebClient
+import openai
+from dotenv import load_dotenv
 
-# -----------------------------------------------------------------------------
-# 0.  Переменные окружения (НУЖНЫ В Рендере!)
-#     - SLACK_BOT_TOKEN        — Bot User OAuth Token «xoxb-…»
-#     - SLACK_SIGNING_SECRET   — Signing Secret
-#     - OPENAI_API_KEY         — ключ OpenAI
-# -----------------------------------------------------------------------------
-SLACK_BOT_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
-SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
-OPENAI_API_KEY       = os.environ["OPENAI_API_KEY"]
+load_dotenv()  # берём переменные из .env, если запускаетесь локально
 
-# -----------------------------------------------------------------------------
+# --- обязательные переменные окружения ---
+SLACK_BOT_TOKEN      = os.getenv("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
+
+missing = [n for n, v in [
+    ("SLACK_BOT_TOKEN", SLACK_BOT_TOKEN),
+    ("SLACK_SIGNING_SECRET", SLACK_SIGNING_SECRET),
+    ("OPENAI_API_KEY", OPENAI_API_KEY)
+] if not v]
+if missing:
+    raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+
+# --- инициализация клиентов ---
 app            = Flask(__name__)
-log            = logging.getLogger(__name__)
-slack_client   = WebClient(token=SLACK_BOT_TOKEN)
+client         = WebClient(token=SLACK_BOT_TOKEN)
 sign_verifier  = SignatureVerifier(SLACK_SIGNING_SECRET)
-openai_client  = OpenAI(api_key=OPENAI_API_KEY)
-# -----------------------------------------------------------------------------
+openai.api_key = OPENAI_API_KEY
+
 
 @app.route("/", methods=["GET"])
-def health():
-    """Render пингует корень — вернём 200, чтобы не было 404."""
+def healthcheck():
     return "OK", 200
 
-# ------------------------------------------------------------------  SLACK EVENTS
+
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
+    # проверяем подпись
     if not sign_verifier.is_valid_request(request.get_data(), request.headers):
-        return "invalid signature", 403
+        return make_response("invalid request", 403)
 
-    payload = request.get_json(force=True)
+    payload = request.get_json()
 
-    # 1) challenge — верификация URL
+    # hand-shake Slack'а при добавлении URL
     if payload.get("type") == "url_verification":
-        return jsonify({"challenge": payload["challenge"]})
+        return make_response(payload.get("challenge"), 200)
 
-    # 2) обычное событие
+    # реальные события
     event = payload.get("event", {})
-    # игнорируем собственные сообщения, чтобы не спамить
-    if event.get("bot_id"):
-        return "", 200
-
-    # пример: реакция на @mention
     if event.get("type") == "app_mention":
-        user   = event["user"]
-        text   = event.get("text", "")
-        thread = event.get("ts")
+        user_text = event.get("text", "")
+        bot_id    = payload["authorizations"][0]["user_id"]
+        cleaned   = user_text.replace(f"<@{bot_id}>", "").strip()
 
-        answer = chat_gpt(text)
-        slack_client.chat_postMessage(
-            channel=event["channel"],
-            text=answer,
-            thread_ts=thread,
-        )
+        answer = ask_chatgpt(cleaned)
+        client.chat_postMessage(channel=event["channel"], text=answer)
 
     return "", 200
 
-# --------------------------------------------------------------  SLASH-КОМАНДА /gpt
-@app.route("/slack/command", methods=["POST"])
-def slash_command():
-    if not sign_verifier.is_valid_request(request.get_data(), request.headers):
-        return "invalid signature", 403
 
-    text      = request.form.get("text", "")
-    channel   = request.form["channel_id"]
-    response_url = request.form["response_url"]
-
-    # сразу ACK, иначе «dispatch_failed»
-    initial = {"response_type": "ephemeral", "text": "⏳ Думаю…"}
-    # важно: вернуть JSON
-    ack = make_response(json.dumps(initial), 200)
-    ack.headers["Content-Type"] = "application/json"
-
-    # основной ответ — асинхронно
-    try:
-        answer = chat_gpt(text or "Hello!")
-        slack_client.chat_postMessage(channel=channel, text=answer)
-    except Exception as e:
-        log.exception("OpenAI error")
-        slack_client.chat_postMessage(channel=channel, text=f"⚠️ Ошибка: {e}")
-
-    return ack
-
-# -------------------------------------------------------------  GPT-помощник
-def chat_gpt(prompt: str) -> str:
-    """Простой вызов OpenAI Chat Completions."""
-    resp = openai_client.chat.completions.create(
+def ask_chatgpt(prompt):
+    resp = openai.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are a helpful assistant"},
-                  {"role": "user",   "content": prompt}],
-        temperature=0.7,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=250
     )
     return resp.choices[0].message.content.strip()
 
-# ----------------------------------------------------------------------------- MAIN
+
 if __name__ == "__main__":
-    # Render слушает любой порт; Flask по умолчанию 5000 → зададим 10000, как в логах
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
