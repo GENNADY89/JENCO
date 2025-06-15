@@ -1,7 +1,9 @@
+
 from flask import Flask, request
 import os
 import openai
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from threading import Thread
 
 app = Flask(__name__)
@@ -17,6 +19,11 @@ def slack_events():
     channel = data.get("channel_id")
     user_id = data.get("user_id")
 
+    print("==== Slack Command Received ====")
+    print(f"User: {user_id}")
+    print(f"Channel: {channel}")
+    print(f"Text: {text}")
+
     def handle_gpt():
         try:
             response = openai.ChatCompletion.create(
@@ -29,12 +36,22 @@ def slack_events():
                 temperature=0.5
             )
             answer = response["choices"][0]["message"]["content"]
-            client.chat_postMessage(channel=channel, text=f"<@{user_id}> {answer}")
+            print("==== GPT Response ====")
+            print(answer)
+            try:
+                client.chat_postMessage(channel=channel, text=f"<@{user_id}> {answer}")
+            except SlackApiError as slack_err:
+                print(f"Slack API Error: {slack_err.response['error']}")
         except Exception as e:
-            client.chat_postMessage(channel=channel, text=f"Ошибка GPT: {str(e)}")
+            print(f"OpenAI Error: {str(e)}")
+            try:
+                client.chat_postMessage(channel=channel, text=f"<@{user_id}> ❌ Ошибка GPT: {str(e)}")
+            except SlackApiError as slack_err:
+                print(f"Slack API Error (fallback): {slack_err.response['error']}")
 
     Thread(target=handle_gpt).start()
     return "OK", 200
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
